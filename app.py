@@ -8,26 +8,33 @@ import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
 from sqlalchemy import create_engine
-from pandasai import PandasAI
+from pandasai import SmartDataframe
 from pandasai.llm import OpenAI
 import sqlite3
 from dotenv import load_dotenv
+import atexit
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Configuration
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-api-key")
+
+# Global variable to store app instance
+app_instance = None
 
 class DataChatApp:
     def __init__(self):
         self.df = None
         self.data_source = None
         self.llm = OpenAI(api_token=OPENAI_API_KEY)
-        self.pandas_ai = PandasAI(self.llm, verbose=True)
+        self.smart_df = None
         self.chat_history = []
         self.temp_files = []
         self.db_connection = None
+        # Make the instance globally accessible for callbacks
+        global app_instance
+        app_instance = self
     
     def load_file(self, file):
         """Load data from uploaded file"""
@@ -48,12 +55,17 @@ class DataChatApp:
             else:
                 return f"Unsupported file format: {file_ext}", None, None
             
+            # Initialize the SmartDataframe
+            self.smart_df = SmartDataframe(self.df, config={"llm": self.llm})
             self.data_source = f"File: {file_name}"
             preview = self.df.head().to_html()
             info = self._get_dataframe_info()
             return f"Loaded successfully: {file_name}", preview, info
         except Exception as e:
             return f"Error loading file: {str(e)}", None, None
+        
+        # Return the dataframe for the dropdown update functions
+        return self.df
     
     def connect_database(self, connection_string, query):
         """Connect to database using connection string"""
@@ -73,12 +85,17 @@ class DataChatApp:
                 return "Please provide a SQL query", None, None
             
             self.df = pd.read_sql(query, self.db_connection)
+            # Initialize the SmartDataframe
+            self.smart_df = SmartDataframe(self.df, config={"llm": self.llm})
             self.data_source = f"Database: {connection_string.split('://')[0]}"
             preview = self.df.head().to_html()
             info = self._get_dataframe_info()
             return "Database connected successfully", preview, info
         except Exception as e:
             return f"Database connection error: {str(e)}", None, None
+            
+        # Return the dataframe for the dropdown update functions
+        return self.df
     
     def _get_dataframe_info(self):
         """Get information about the dataframe"""
@@ -95,18 +112,19 @@ class DataChatApp:
     
     def chat_with_data(self, query, history):
         """Process natural language query against the loaded data"""
-        if self.df is None:
+        if self.df is None or self.smart_df is None:
             return "Please load data first before querying.", history
         
         if not query:
             return "Please enter a query.", history
         
         try:
-            # Add the user query to history
-            history.append((query, ""))
+            # Add the user query to history with the proper format for messages type
+            if history is None:
+                history = []
             
-            # Process the query using PandasAI
-            response = self.pandas_ai(self.df, prompt=query)
+            # Process the query using SmartDataframe
+            response = self.smart_df.chat(query)
             
             # Check if response contains a figure from matplotlib
             if isinstance(response, plt.Figure):
@@ -117,19 +135,26 @@ class DataChatApp:
                 self.temp_files.append(temp_file.name)
                 
                 # Update the response with the path to the figure
-                response = f"<img src='file={temp_file.name}' alt='Visualization' />"
+                response_text = f"<img src='file={temp_file.name}' alt='Visualization' />"
             
             # If response is a dataframe, convert it to an HTML table
             elif isinstance(response, pd.DataFrame):
-                response = f"<div style='overflow-x: auto;'>{response.to_html(index=False)}</div>"
+                response_text = f"<div style='overflow-x: auto;'>{response.to_html(index=False)}</div>"
+            else:
+                response_text = str(response)
             
-            # Update the last response in history
-            history[-1] = (query, str(response))
+            # Add messages in the proper format for Gradio Chatbot with type="messages"
+            history.append({"role": "user", "content": query})
+            history.append({"role": "assistant", "content": response_text})
             
-            return response, history
+            return "", history
         except Exception as e:
-            history[-1] = (query, f"Error processing query: {str(e)}")
-            return f"Error processing query: {str(e)}", history
+            # Handle errors in the proper format
+            if not history:
+                history = []
+            history.append({"role": "user", "content": query})
+            history.append({"role": "assistant", "content": f"Error processing query: {str(e)}"})
+            return "", history
     
     def create_visualization(self, viz_type, x_axis, y_axis, title):
         """Create visualization based on user selection"""
@@ -193,7 +218,37 @@ class DataChatApp:
             if not num_cols:
                 return "No numerical columns found for summary cards."
             
-            cards_html = "<div style='display: flex; flex-wrap: wrap; gap: 10px;'>"
+            cards_html = """
+            <style>
+                .summary-card {
+                    background-color: #f5f5f5; 
+                    border-radius: 5px; 
+                    padding: 15px; 
+                    min-width: 200px; 
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    margin: 10px;
+                }
+                .summary-card h3 {
+                    margin-top: 0; 
+                    color: #333 !important;
+                    font-weight: bold;
+                }
+                .summary-card p {
+                    color: #333 !important;
+                    margin: 8px 0;
+                }
+                .summary-card strong {
+                    font-weight: bold;
+                    color: #333 !important;
+                }
+                .summary-container {
+                    display: flex; 
+                    flex-wrap: wrap; 
+                    gap: 10px;
+                }
+            </style>
+            <div class="summary-container">
+            """
             
             for col in num_cols:
                 mean_val = self.df[col].mean()
@@ -202,8 +257,8 @@ class DataChatApp:
                 max_val = self.df[col].max()
                 
                 card_html = f"""
-                <div style='background-color: #f5f5f5; border-radius: 5px; padding: 15px; min-width: 200px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);'>
-                    <h3 style='margin-top: 0; color: #333;'>{col}</h3>
+                <div class="summary-card">
+                    <h3>{col}</h3>
                     <p><strong>Mean:</strong> {mean_val:.2f}</p>
                     <p><strong>Median:</strong> {median_val:.2f}</p>
                     <p><strong>Min:</strong> {min_val:.2f}</p>
@@ -240,6 +295,12 @@ class DataChatApp:
 def create_interface():
     app = DataChatApp()
     
+    # Helper functions to update dropdowns
+    def update_column_options():
+        if app_instance and app_instance.df is not None:
+            return gr.update(choices=list(app_instance.df.columns))
+        return gr.update(choices=[])
+    
     with gr.Blocks(theme=gr.themes.Soft(), title="Data Chat App") as interface:
         gr.Markdown("""
         # 📊 Data Chat Application
@@ -269,7 +330,7 @@ def create_interface():
                 info = gr.JSON(label="Data Information")
             
             with gr.TabItem("Chat with Data"):
-                chat_interface = gr.Chatbot(height=400)
+                chat_interface = gr.Chatbot(height=400, type="messages")
                 query_input = gr.Textbox(
                     label="Ask a question about your data",
                     placeholder="E.g., Show me the trend of sales over time",
@@ -301,12 +362,28 @@ def create_interface():
             app.load_file, 
             inputs=[file_input], 
             outputs=[file_result, preview, info]
+        ).then(
+            update_column_options,
+            inputs=None,
+            outputs=[x_axis]
+        ).then(
+            update_column_options,
+            inputs=None,
+            outputs=[y_axis]
         )
         
         db_connect_button.click(
             app.connect_database, 
             inputs=[conn_str, query], 
             outputs=[db_result, preview, info]
+        ).then(
+            update_column_options,
+            inputs=None,
+            outputs=[x_axis]
+        ).then(
+            update_column_options,
+            inputs=None,
+            outputs=[y_axis]
         )
         
         chat_button.click(
@@ -315,16 +392,14 @@ def create_interface():
             outputs=[query_input, chat_interface]
         )
         
-        # Update dropdown options when data is loaded
-        def update_column_options():
-            if app.df is not None:
-                return gr.Dropdown.update(choices=list(app.df.columns))
-            return gr.Dropdown.update(choices=[])
+        # Also allow Enter key to submit
+        query_input.submit(
+            app.chat_with_data,
+            inputs=[query_input, chat_interface],
+            outputs=[query_input, chat_interface]
+        )
         
-        file_upload_button.click(update_column_options, outputs=[x_axis])
-        file_upload_button.click(update_column_options, outputs=[y_axis])
-        db_connect_button.click(update_column_options, outputs=[x_axis])
-        db_connect_button.click(update_column_options, outputs=[y_axis])
+        # We've replaced this with the .then() functions above
         
         viz_button.click(
             app.create_visualization, 
@@ -337,11 +412,18 @@ def create_interface():
             outputs=[summary_output]
         )
         
-        # Cleanup on close
-        interface.on_close(app.cleanup)
+        # Register cleanup function for when the app closes
+        # The on_close method is no longer available in newer Gradio versions
+        # Instead, we'll clean up temp files when the server restarts
+        app.cleanup()  # Clean up any previous temp files
     
     return interface
 
 if __name__ == "__main__":
+    # Set up atexit handler to clean up temp files when the app exits
+    import atexit
+    app = DataChatApp()
+    atexit.register(app.cleanup)
+    
     interface = create_interface()
     interface.launch(share=True)
