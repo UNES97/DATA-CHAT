@@ -13,14 +13,13 @@ from pandasai.llm import OpenAI
 import sqlite3
 from dotenv import load_dotenv
 import atexit
+import base64
+import io
 
-# Load environment variables from .env file
 load_dotenv()
 
-# Configuration
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-api-key")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Global variable to store app instance
 app_instance = None
 
 class DataChatApp:
@@ -32,7 +31,6 @@ class DataChatApp:
         self.chat_history = []
         self.temp_files = []
         self.db_connection = None
-        # Make the instance globally accessible for callbacks
         global app_instance
         app_instance = self
     
@@ -64,28 +62,24 @@ class DataChatApp:
         except Exception as e:
             return f"Error loading file: {str(e)}", None, None
         
-        # Return the dataframe for the dropdown update functions
         return self.df
     
     def connect_database(self, connection_string, query):
         """Connect to database using connection string"""
         try:
             if connection_string.startswith('sqlite:'):
-                # For SQLite, create a temporary database if it's a memory connection
                 if 'memory' in connection_string:
                     self.db_connection = sqlite3.connect(':memory:')
                 else:
                     db_path = connection_string.replace('sqlite:///', '')
                     self.db_connection = sqlite3.connect(db_path)
             else:
-                # For PostgreSQL, MySQL, etc.
                 self.db_connection = create_engine(connection_string)
             
             if not query:
                 return "Please provide a SQL query", None, None
             
             self.df = pd.read_sql(query, self.db_connection)
-            # Initialize the SmartDataframe
             self.smart_df = SmartDataframe(self.df, config={"llm": self.llm})
             self.data_source = f"Database: {connection_string.split('://')[0]}"
             preview = self.df.head().to_html()
@@ -94,7 +88,6 @@ class DataChatApp:
         except Exception as e:
             return f"Database connection error: {str(e)}", None, None
             
-        # Return the dataframe for the dropdown update functions
         return self.df
     
     def _get_dataframe_info(self):
@@ -119,37 +112,29 @@ class DataChatApp:
             return "Please enter a query.", history
         
         try:
-            # Add the user query to history with the proper format for messages type
             if history is None:
                 history = []
             
-            # Process the query using SmartDataframe
             response = self.smart_df.chat(query)
             
-            # Check if response contains a figure from matplotlib
             if isinstance(response, plt.Figure):
-                # Save figure to a temporary file
                 temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.png')
                 response.savefig(temp_file.name)
                 temp_file.close()
                 self.temp_files.append(temp_file.name)
                 
-                # Update the response with the path to the figure
                 response_text = f"<img src='file={temp_file.name}' alt='Visualization' />"
             
-            # If response is a dataframe, convert it to an HTML table
             elif isinstance(response, pd.DataFrame):
                 response_text = f"<div style='overflow-x: auto;'>{response.to_html(index=False)}</div>"
             else:
                 response_text = str(response)
             
-            # Add messages in the proper format for Gradio Chatbot with type="messages"
             history.append({"role": "user", "content": query})
             history.append({"role": "assistant", "content": response_text})
             
             return "", history
         except Exception as e:
-            # Handle errors in the proper format
             if not history:
                 history = []
             history.append({"role": "user", "content": query})
@@ -161,49 +146,73 @@ class DataChatApp:
         if self.df is None:
             return "Please load data first before creating visualizations."
         
-        if not x_axis or (viz_type != 'pie' and not y_axis):
+        if not x_axis or (viz_type != 'pie' and viz_type != 'histogram' and not y_axis):
             return "Please select both X and Y axis for the visualization."
         
         try:
-            # Check if selected columns exist
             if x_axis not in self.df.columns:
                 return f"Column '{x_axis}' not found in the data."
             
-            if viz_type != 'pie' and y_axis not in self.df.columns:
+            if viz_type != 'pie' and viz_type != 'histogram' and y_axis not in self.df.columns:
                 return f"Column '{y_axis}' not found in the data."
             
-            fig = None
+            plt.figure(figsize=(10, 6))
             
-            # Create visualization based on the type
             if viz_type == 'bar':
-                fig = px.bar(self.df, x=x_axis, y=y_axis, title=title or f"Bar Chart: {y_axis} by {x_axis}")
-            
+                plt.bar(self.df[x_axis], self.df[y_axis])
+                plt.xlabel(x_axis)
+                plt.ylabel(y_axis)
+                plt.title(title or f"Bar Chart: {y_axis} by {x_axis}")
+                
             elif viz_type == 'line':
-                fig = px.line(self.df, x=x_axis, y=y_axis, title=title or f"Line Chart: {y_axis} over {x_axis}")
-            
+                plt.plot(self.df[x_axis], self.df[y_axis])
+                plt.xlabel(x_axis)
+                plt.ylabel(y_axis)
+                plt.title(title or f"Line Chart: {y_axis} over {x_axis}")
+                
             elif viz_type == 'scatter':
-                fig = px.scatter(self.df, x=x_axis, y=y_axis, title=title or f"Scatter Plot: {y_axis} vs {x_axis}")
-            
+                plt.scatter(self.df[x_axis], self.df[y_axis])
+                plt.xlabel(x_axis)
+                plt.ylabel(y_axis)
+                plt.title(title or f"Scatter Plot: {y_axis} vs {x_axis}")
+                
             elif viz_type == 'pie':
-                # For pie charts, we use the x_axis as names and can either count occurrences or use y_axis as values
-                if y_axis:
-                    fig = px.pie(self.df, names=x_axis, values=y_axis, title=title or f"Pie Chart: {y_axis} by {x_axis}")
+                if y_axis and y_axis in self.df.columns:
+                    pie_data = self.df.groupby(x_axis)[y_axis].sum()
+                    plt.pie(pie_data, labels=pie_data.index, autopct='%1.1f%%')
                 else:
-                    # Count occurrences of each category in x_axis
-                    counts = self.df[x_axis].value_counts().reset_index()
-                    counts.columns = ['category', 'count']
-                    fig = px.pie(counts, names='category', values='count', title=title or f"Pie Chart: Distribution of {x_axis}")
-            
+                    counts = self.df[x_axis].value_counts()
+                    plt.pie(counts, labels=counts.index, autopct='%1.1f%%')
+                plt.title(title or f"Pie Chart: Distribution of {x_axis}")
+                
             elif viz_type == 'histogram':
-                fig = px.histogram(self.df, x=x_axis, title=title or f"Histogram: Distribution of {x_axis}")
+                plt.hist(self.df[x_axis], bins=20)
+                plt.xlabel(x_axis)
+                plt.ylabel('Frequency')
+                plt.title(title or f"Histogram: Distribution of {x_axis}")
             
-            # Return as HTML
-            if fig:
-                return fig.to_html(include_plotlyjs='cdn', full_html=False)
-            else:
-                return "Failed to create visualization."
+            plt.tight_layout()
+            
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.png')
+            plt.savefig(temp_file.name, dpi=100, bbox_inches='tight')
+            temp_file.close()
+            self.temp_files.append(temp_file.name)
+            
+            with open(temp_file.name, 'rb') as img_file:
+                img_data = base64.b64encode(img_file.read()).decode('utf-8')
+            
+            html_content = f"""
+            <div style="text-align: center; padding: 20px; background-color: white; border-radius: 10px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+                <img src="data:image/png;base64,{img_data}" style="max-width: 100%; height: auto;" alt="Visualization">
+            </div>
+            """
+            
+            plt.close()
+            
+            return html_content
                 
         except Exception as e:
+            plt.close()
             return f"Error creating visualization: {str(e)}"
     
     def generate_summary_cards(self):
@@ -212,7 +221,6 @@ class DataChatApp:
             return "Please load data first before generating summary cards."
         
         try:
-            # Get numerical columns
             num_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
             
             if not num_cols:
@@ -282,7 +290,6 @@ class DataChatApp:
             except Exception:
                 pass
         
-        # Close database connection if exists
         if self.db_connection is not None:
             try:
                 if hasattr(self.db_connection, 'close'):
@@ -295,13 +302,16 @@ class DataChatApp:
 def create_interface():
     app = DataChatApp()
     
-    # Helper functions to update dropdowns
     def update_column_options():
         if app_instance and app_instance.df is not None:
             return gr.update(choices=list(app_instance.df.columns))
         return gr.update(choices=[])
     
-    with gr.Blocks(theme=gr.themes.Soft(), title="Data Chat App") as interface:
+    with gr.Blocks(theme=gr.themes.Soft(), title="Data Chat App", css="""
+        .plot-container {width: 100% !important; height: 100% !important;}
+        .js-plotly-plot {min-height: 500px;}
+        .plotly {min-height: 500px;}
+    """) as interface:
         gr.Markdown("""
         # 📊 Data Chat Application
         Upload your data file or connect to a database, then chat with your data using natural language!
@@ -343,15 +353,16 @@ def create_interface():
                     with gr.Column(scale=1):
                         viz_type = gr.Dropdown(
                             choices=["bar", "line", "scatter", "pie", "histogram"],
-                            label="Visualization Type"
+                            label="Visualization Type",
+                            value="bar"  # Set a default value
                         )
                         x_axis = gr.Dropdown(label="X-Axis / Category")
                         y_axis = gr.Dropdown(label="Y-Axis / Values (Optional for Pie & Histogram)")
                         viz_title = gr.Textbox(label="Chart Title (Optional)")
-                        viz_button = gr.Button("Generate Visualization")
+                        viz_button = gr.Button("Generate Visualization", variant="primary")
                     
                     with gr.Column(scale=2):
-                        viz_output = gr.HTML(label="Visualization")
+                        viz_output = gr.HTML(label="Visualization", value="<div style='width:100%; height:500px; display:flex; justify-content:center; align-items:center; color:#666; font-size:16px;'>Your visualization will appear here</div>")
             
             with gr.TabItem("Summary Stats"):
                 summary_button = gr.Button("Generate Summary Cards")
@@ -392,14 +403,12 @@ def create_interface():
             outputs=[query_input, chat_interface]
         )
         
-        # Also allow Enter key to submit
         query_input.submit(
             app.chat_with_data,
             inputs=[query_input, chat_interface],
             outputs=[query_input, chat_interface]
         )
         
-        # We've replaced this with the .then() functions above
         
         viz_button.click(
             app.create_visualization, 
@@ -420,7 +429,6 @@ def create_interface():
     return interface
 
 if __name__ == "__main__":
-    # Set up atexit handler to clean up temp files when the app exits
     import atexit
     app = DataChatApp()
     atexit.register(app.cleanup)
