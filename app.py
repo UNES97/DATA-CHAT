@@ -313,7 +313,7 @@ def create_interface():
         .plotly {min-height: 500px;}
     """) as interface:
         gr.Markdown("""
-        # 📊 Data Chat Application
+        # GIN Data Chat Application
         Upload your data file or connect to a database, then chat with your data using natural language!
         """)
         
